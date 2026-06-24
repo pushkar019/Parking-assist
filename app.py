@@ -1,17 +1,56 @@
 """
 MMCOE Campus Parking Management System — Web Edition
 Created by Pushkar
-Hosted on Railway — https://railway.app
+With persistent SQLite database — data survives server restarts.
 """
 
-import os, datetime
+import os, datetime, sqlite3, json
 from collections import OrderedDict
 from flask import Flask, jsonify, request
 
-app = Flask(__name__)
+app  = Flask(__name__)
+DB   = os.path.join(os.path.dirname(__file__), "parking.db")
 
 # ══════════════════════════════════════════════════════════════════════════════
-# DATA MODEL  (in-memory — persists while server is running)
+# DATABASE  — SQLite (persistent, zero config)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def get_db():
+    conn = sqlite3.connect(DB)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    with get_db() as c:
+        c.executescript("""
+        CREATE TABLE IF NOT EXISTS active_parking (
+            user_id   TEXT PRIMARY KEY,
+            slot      TEXT NOT NULL,
+            role      TEXT NOT NULL,
+            vehicle   TEXT NOT NULL,
+            branch    TEXT DEFAULT '',
+            time_in   TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS parking_log (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            date       TEXT,
+            user_id    TEXT,
+            role       TEXT,
+            branch     TEXT,
+            vehicle    TEXT,
+            slot       TEXT,
+            time_in    TEXT,
+            time_out   TEXT DEFAULT '',
+            duration   TEXT DEFAULT '',
+            status     TEXT
+        );
+        """)
+
+init_db()
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SLOT POOLS  (in-memory set — rebuilt from DB on startup)
 # ══════════════════════════════════════════════════════════════════════════════
 
 BRANCH_MAP = {
@@ -21,64 +60,43 @@ BRANCH_MAP = {
     "ET": "Electronics",     "AI": "AI & ML",
 }
 
-class ParkingData:
-    def __init__(self):
-        self.pools = OrderedDict([
-            ("T4W", {f"T4W-{i:02d}": None for i in range(1, 18)}),
-            ("T2W", {f"T2W-{i:02d}": None for i in range(1, 24)}),
-            ("S4W", {f"S4W-{i:02d}": None for i in range(1, 21)}),
-            ("S2W", {f"S2W-{i:02d}": None for i in range(1, 101)}),
-            ("G4W", {f"G4W-{i:02d}": None for i in range(1, 8)}),
-            ("G2W", {f"G2W-{i:02d}": None for i in range(1, 9)}),
-        ])
-        self.active  = {}   # uid → {slot, time_in, role, vehicle}
-        self.history = []   # list of log dicts
+ALL_SLOTS = OrderedDict([
+    ("T4W", [f"T4W-{i:02d}" for i in range(1, 18)]),
+    ("T2W", [f"T2W-{i:02d}" for i in range(1, 24)]),
+    ("S4W", [f"S4W-{i:02d}" for i in range(1, 21)]),
+    ("S2W", [f"S2W-{i:02d}" for i in range(1, 101)]),
+    ("G4W", [f"G4W-{i:02d}" for i in range(1, 8)]),
+    ("G2W", [f"G2W-{i:02d}" for i in range(1, 9)]),
+])
 
-    def pool_key(self, role, vehicle):
-        p = {"Student": "S", "Teacher": "T", "Guest": "G"}[role]
-        return p + ("4W" if vehicle == "4-Wheeler" else "2W")
+def pool_key(role, vehicle):
+    p = {"Student": "S", "Teacher": "T", "Guest": "G"}[role]
+    return p + ("4W" if vehicle == "4-Wheeler" else "2W")
 
-    def totals(self):
-        return {k: (sum(1 for v in s.values() if v is None), len(s))
-                for k, s in self.pools.items()}
+def get_occupied_slots():
+    with get_db() as c:
+        rows = c.execute("SELECT slot FROM active_parking").fetchall()
+    return {r["slot"] for r in rows}
 
-    def allocate(self, uid, role, vehicle):
-        if uid in self.active:
-            return None, f"{uid} is already parked in slot {self.active[uid]['slot']}."
-        key = self.pool_key(role, vehicle)
-        for slot, occ in self.pools[key].items():
-            if occ is None:
-                self.pools[key][slot] = uid
-                t = datetime.datetime.now()
-                self.active[uid] = {"slot": slot, "time_in": t,
-                                     "role": role, "vehicle": vehicle}
-                self.history.append({
-                    "time": t.strftime("%H:%M:%S"), "date": t.strftime("%Y-%m-%d"),
-                    "id": uid, "role": role, "vehicle": vehicle,
-                    "slot": slot, "status": "PARKED", "duration": ""
-                })
-                return slot, None
-        return None, f"No {vehicle} slots left for {role}s — pool {key} is FULL."
+def get_totals():
+    occupied = get_occupied_slots()
+    result   = {}
+    for key, slots in ALL_SLOTS.items():
+        total = len(slots)
+        used  = sum(1 for s in slots if s in occupied)
+        result[key] = (total - used, total)
+    return result
 
-    def release(self, uid):
-        if uid not in self.active:
-            return None, f"ID '{uid}' not found in active records."
-        s   = self.active.pop(uid)
-        self.pools[s["slot"][:3]][s["slot"]] = None
-        t   = datetime.datetime.now()
-        dur = round((t - s["time_in"]).total_seconds() / 60, 1)
-        self.history.append({
-            "time": t.strftime("%H:%M:%S"), "date": t.strftime("%Y-%m-%d"),
-            "id": uid, "role": s["role"], "vehicle": s["vehicle"],
-            "slot": s["slot"], "status": "EXITED", "duration": f"{dur} min"
-        })
-        return {**s, "time_out": t, "duration": dur}, None
+def next_free_slot(key):
+    occupied = get_occupied_slots()
+    for slot in ALL_SLOTS[key]:
+        if slot not in occupied:
+            return slot
+    return None
 
-    def active_list(self):
-        return [{"id": uid, "slot": v["slot"], "role": v["role"],
-                 "vehicle": v["vehicle"],
-                 "time_in": v["time_in"].strftime("%H:%M:%S")}
-                for uid, v in self.active.items()]
+# ══════════════════════════════════════════════════════════════════════════════
+# ID PARSER
+# ══════════════════════════════════════════════════════════════════════════════
 
 def parse_id(raw):
     raw = raw.strip().upper()
@@ -90,47 +108,122 @@ def parse_id(raw):
         return {"id": raw, "role": "Teacher", "branch_code": "", "display": "Faculty"}
     return {"id": raw, "role": "Guest", "branch_code": "", "display": "Visitor"}
 
-db = ParkingData()
-
 # ══════════════════════════════════════════════════════════════════════════════
-# API
+# API ROUTES
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.route("/api/status")
 def api_status():
-    return jsonify({"totals": db.totals(), "active": db.active_list(),
-                    "time": datetime.datetime.now().strftime("%A, %d %b %Y  %H:%M:%S")})
+    with get_db() as c:
+        rows = c.execute(
+            "SELECT user_id, slot, role, vehicle, time_in FROM active_parking ORDER BY time_in"
+        ).fetchall()
+    active = [{"id": r["user_id"], "slot": r["slot"], "role": r["role"],
+               "vehicle": r["vehicle"], "time_in": r["time_in"]} for r in rows]
+    return jsonify({
+        "totals": get_totals(),
+        "active": active,
+        "time":   datetime.datetime.now().strftime("%A, %d %b %Y  %H:%M:%S"),
+    })
 
 @app.route("/api/lookup", methods=["POST"])
 def api_lookup():
     raw = (request.json or {}).get("id", "").strip()
-    if not raw: return jsonify({"error": "No ID provided."}), 400
+    if not raw:
+        return jsonify({"error": "No ID provided."}), 400
     return jsonify(parse_id(raw))
 
 @app.route("/api/entry", methods=["POST"])
 def api_entry():
-    d = request.json or {}
-    raw, vehicle = d.get("id","").strip(), d.get("vehicle","").strip()
-    if not raw or vehicle not in ("2-Wheeler","4-Wheeler"):
+    d       = request.json or {}
+    raw     = d.get("id", "").strip()
+    vehicle = d.get("vehicle", "").strip()
+    if not raw or vehicle not in ("2-Wheeler", "4-Wheeler"):
         return jsonify({"error": "Invalid ID or vehicle type."}), 400
+
     info = parse_id(raw)
-    slot, err = db.allocate(info["id"], info["role"], vehicle)
-    if err: return jsonify({"error": err}), 409
+
+    # Check already parked
+    with get_db() as c:
+        existing = c.execute(
+            "SELECT slot FROM active_parking WHERE user_id=?", (info["id"],)
+        ).fetchone()
+        if existing:
+            return jsonify({"error": f"{info['id']} is already parked in slot {existing['slot']}."}), 409
+
+        key  = pool_key(info["role"], vehicle)
+        slot = next_free_slot(key)
+        if not slot:
+            return jsonify({"error": f"No {vehicle} slots left for {info['role']}s — {key} is FULL."}), 409
+
+        now = datetime.datetime.now()
+        t   = now.strftime("%H:%M:%S")
+        dt  = now.strftime("%Y-%m-%d")
+
+        c.execute(
+            "INSERT INTO active_parking (user_id, slot, role, vehicle, branch, time_in) VALUES (?,?,?,?,?,?)",
+            (info["id"], slot, info["role"], vehicle, info["branch_code"], t)
+        )
+        c.execute(
+            "INSERT INTO parking_log (date, user_id, role, branch, vehicle, slot, time_in, status) VALUES (?,?,?,?,?,?,?,?)",
+            (dt, info["id"], info["role"], info["branch_code"], vehicle, slot, t, "PARKED")
+        )
+
     return jsonify({"slot": slot, "role": info["role"],
                     "display": info["display"], "vehicle": vehicle})
 
 @app.route("/api/exit", methods=["POST"])
 def api_exit():
-    raw = (request.json or {}).get("id","").strip()
-    if not raw: return jsonify({"error": "No ID provided."}), 400
+    raw = (request.json or {}).get("id", "").strip()
+    if not raw:
+        return jsonify({"error": "No ID provided."}), 400
+
     info = parse_id(raw)
-    session, err = db.release(info["id"])
-    if err: return jsonify({"error": err}), 404
-    return jsonify({"slot": session["slot"], "duration": session["duration"]})
+    with get_db() as c:
+        row = c.execute(
+            "SELECT slot, role, vehicle, branch, time_in FROM active_parking WHERE user_id=?",
+            (info["id"],)
+        ).fetchone()
+        if not row:
+            return jsonify({"error": f"ID '{info['id']}' not found in active records."}), 404
+
+        now     = datetime.datetime.now()
+        t_out   = now.strftime("%H:%M:%S")
+        dt      = now.strftime("%Y-%m-%d")
+        # calculate duration
+        try:
+            t_in_dt = datetime.datetime.strptime(row["time_in"], "%H:%M:%S").replace(
+                year=now.year, month=now.month, day=now.day)
+            dur = round((now - t_in_dt).total_seconds() / 60, 1)
+        except Exception:
+            dur = 0
+
+        c.execute("DELETE FROM active_parking WHERE user_id=?", (info["id"],))
+        c.execute(
+            "INSERT INTO parking_log (date, user_id, role, branch, vehicle, slot, time_in, time_out, duration, status) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (dt, info["id"], info["role"], row["branch"], row["vehicle"],
+             row["slot"], row["time_in"], t_out, f"{dur} min", "EXITED")
+        )
+
+    return jsonify({"slot": row["slot"], "duration": dur})
 
 @app.route("/api/log")
 def api_log():
-    return jsonify(list(reversed(db.history[-300:])))
+    with get_db() as c:
+        rows = c.execute(
+            "SELECT * FROM parking_log ORDER BY id DESC LIMIT 300"
+        ).fetchall()
+    return jsonify([dict(r) for r in rows])
+
+@app.route("/api/reset", methods=["POST"])
+def api_reset():
+    """Clear only active parking (for admin use — keeps log intact)."""
+    secret = (request.json or {}).get("secret", "")
+    if secret != os.environ.get("RESET_SECRET", "mmcoe2024"):
+        return jsonify({"error": "Unauthorized"}), 401
+    with get_db() as c:
+        c.execute("DELETE FROM active_parking")
+    return jsonify({"ok": True})
 
 # ══════════════════════════════════════════════════════════════════════════════
 # FRONTEND
@@ -155,6 +248,7 @@ HTML = """<!DOCTYPE html>
   --text:#E6EDF3;--muted:#8B949E;--hi:#1F6FEB;--r:10px;
 }
 body{background:var(--bg);color:var(--text);font-family:'Segoe UI',system-ui,sans-serif;min-height:100vh}
+*,*::before,*::after{box-sizing:border-box}
 
 /* topbar */
 .topbar{background:var(--panel);border-bottom:1px solid var(--border);
@@ -162,9 +256,9 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI',system-ui,san
   padding:0 20px;height:54px;position:sticky;top:0;z-index:99}
 .topbar-l{display:flex;align-items:center;gap:10px}
 .logo{font-size:20px}
-.topbar h1{font-size:14px;font-weight:700;color:var(--accent);letter-spacing:.5px}
-.topbar-r{display:flex;align-items:center;gap:16px}
-#clock{font-family:Consolas,monospace;font-size:12px;color:var(--muted)}
+.topbar h1{font-size:13px;font-weight:700;color:var(--accent);letter-spacing:.5px}
+.topbar-r{display:flex;align-items:center;gap:14px}
+#clock{font-family:Consolas,monospace;font-size:11px;color:var(--muted)}
 .badge{font-size:11px;color:var(--muted);border:1px solid var(--border);
   border-radius:20px;padding:3px 12px}
 .badge b{color:var(--accent)}
@@ -235,7 +329,7 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI',system-ui,san
 /* output */
 #outbox{margin:12px 14px;background:var(--card);border-radius:10px;
   min-height:120px;display:flex;align-items:center;justify-content:center;
-  text-align:center;padding:18px;transition:background .3s}
+  text-align:center;padding:18px}
 #outtxt{font-size:15px;font-weight:700;color:var(--muted);
   white-space:pre-line;line-height:1.65}
 .os{color:var(--green)!important;font-size:18px!important}
@@ -268,21 +362,21 @@ tr:last-child td{border:none}
 .lid{color:var(--text);min-width:100px}.lsl{color:var(--accent);min-width:72px}
 .lro{color:var(--muted);min-width:62px}.ltm{color:var(--muted);min-width:64px}
 
-/* stats bar */
-.statsbar{display:flex;gap:20px;padding:10px 16px;border-top:1px solid var(--border);
-  flex-wrap:wrap}
-.stat{font-size:11px;color:var(--muted)}
-.stat b{color:var(--text)}
+/* stats */
+.statsbar{display:flex;gap:20px;padding:10px 16px;border-top:1px solid var(--border);flex-wrap:wrap}
+.stat{font-size:11px;color:var(--muted)}.stat b{color:var(--text)}
 
-/* footer */
+/* saved badge */
+.saved-pill{display:inline-flex;align-items:center;gap:5px;font-size:10px;
+  background:#0d3320;color:var(--green);border:1px solid #196127;
+  border-radius:20px;padding:3px 10px;margin-left:8px}
+
 footer{text-align:center;padding:16px;font-size:11px;color:var(--border);
   border-top:1px solid var(--border);margin-top:4px}
 footer span{color:var(--accent)}
 
-/* pulse dot */
 .dot{display:inline-block;width:7px;height:7px;border-radius:50%;
-  background:var(--green);margin-right:5px;
-  animation:pulse 2s infinite}
+  background:var(--green);margin-right:5px;animation:pulse 2s infinite}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
 @keyframes flash{0%,100%{opacity:1}50%{opacity:.35}}
 .flash{animation:flash .35s ease 2}
@@ -294,6 +388,7 @@ footer span{color:var(--accent)}
   <div class="topbar-l">
     <span class="logo">🅿</span>
     <h1>MMCOE CAMPUS PARKING MANAGEMENT SYSTEM</h1>
+    <span class="saved-pill">💾 Data Saved</span>
   </div>
   <div class="topbar-r">
     <span id="clock"></span>
@@ -306,7 +401,6 @@ footer span{color:var(--accent)}
 </button>
 
 <div class="grid">
-
   <!-- LEFT -->
   <div class="col">
     <div class="pnl">
@@ -318,11 +412,10 @@ footer span{color:var(--accent)}
         <div class="stat">Available: <b id="stat-av">175</b></div>
       </div>
     </div>
-
     <div class="pnl" style="flex:1">
       <div class="tabs">
         <div class="tab on" onclick="swTab('active',this)">🔒 Currently Parked</div>
-        <div class="tab"    onclick="swTab('log',this)">📋 Recent Activity</div>
+        <div class="tab"    onclick="swTab('log',this)">📋 Activity Log</div>
       </div>
       <div class="tc on" id="tc-active">
         <div class="tw" id="active-wrap"><div class="empty">No vehicles parked yet.</div></div>
@@ -338,7 +431,7 @@ footer span{color:var(--accent)}
     <div class="pnl">
       <div class="pnl-title">⌨ Barcode Scanner / Manual ID Input</div>
       <div class="sinp">
-        <div class="hint">USB barcode scanner types here automatically. Press <b>Enter</b> or click GO.</div>
+        <div class="hint">USB scanner types here automatically. Press <b>Enter</b> or click GO.</div>
         <div class="srow">
           <input id="idinput" type="text" placeholder="e.g. B25CE1133"
             autocomplete="off" spellcheck="false"
@@ -357,18 +450,16 @@ footer span{color:var(--accent)}
       </div>
       <div class="qrow">
         <span style="font-size:10px;color:var(--muted);align-self:center">Quick test →</span>
-        <button class="qbtn" onclick="inject('B25CE1133')">Student B25CE1133</button>
-        <button class="qbtn" onclick="inject('T_SHARMA')">Teacher T_SHARMA</button>
-        <button class="qbtn" onclick="inject('GUEST01')">Guest GUEST01</button>
+        <button class="qbtn" onclick="inject('B25CE1133')">Student</button>
+        <button class="qbtn" onclick="inject('T_SHARMA')">Teacher</button>
+        <button class="qbtn" onclick="inject('GUEST01')">Guest</button>
       </div>
     </div>
-
     <div class="pnl" style="flex:1">
       <div class="pnl-title">📢 System Output</div>
       <div id="outbox"><div id="outtxt">Awaiting scan or ID entry…</div></div>
     </div>
   </div>
-
 </div>
 
 <footer>
@@ -379,7 +470,6 @@ footer span{color:var(--accent)}
 
 <script>
 let mode='ENTRY', pending=null;
-
 const POOLS=[
   {key:'T4W',lbl:'Teachers 4-Wheeler',cls:'ct',total:17},
   {key:'T2W',lbl:'Teachers 2-Wheeler',cls:'ct',total:23},
@@ -389,7 +479,6 @@ const POOLS=[
   {key:'G2W',lbl:'Guests 2-Wheeler',  cls:'cg',total:8},
 ];
 
-// build counter cards
 document.getElementById('cgrid').innerHTML=POOLS.map(p=>`
   <div class="cc ${p.cls}" id="cc-${p.key}">
     <div class="lbl">${p.lbl}</div>
@@ -397,14 +486,12 @@ document.getElementById('cgrid').innerHTML=POOLS.map(p=>`
     <div class="sub">Total: ${p.total}</div>
   </div>`).join('');
 
-// clock
 setInterval(()=>{
   document.getElementById('clock').textContent=
     new Date().toLocaleString('en-IN',{weekday:'short',day:'2-digit',
     month:'short',year:'numeric',hour:'2-digit',minute:'2-digit',second:'2-digit'});
 },1000);
 
-// refresh every 3s
 async function refresh(){
   try{
     const d=await(await fetch('/api/status')).json();
@@ -439,7 +526,6 @@ function renderActive(rows){
   </tr>`).join('')}</tbody></table>`;
 }
 
-// tabs
 function swTab(name,el){
   document.querySelectorAll('.tab,.tc').forEach(x=>x.classList.remove('on'));
   el.classList.add('on');
@@ -454,17 +540,16 @@ async function loadLog(){
     if(!rows.length){w.innerHTML='<div class="empty">No activity yet.</div>';return;}
     w.innerHTML=rows.map(r=>`<div class="lr">
       <span class="${r.status==='PARKED'?'lp':'le'}">${r.status}</span>
-      <span class="lid">${r.id}</span>
+      <span class="lid">${r.user_id}</span>
       <span class="lsl">${r.slot}</span>
       <span class="lro">${r.role}</span>
-      <span class="ltm">${r.time}</span>
+      <span class="ltm">${r.time_in}</span>
       <span style="color:var(--muted)">${r.vehicle}</span>
       ${r.duration?`<span style="color:var(--muted)">${r.duration}</span>`:''}
     </div>`).join('');
   }catch(e){w.innerHTML='<div class="empty">Could not load log.</div>';}
 }
 
-// mode toggle
 function toggleMode(){
   mode=mode==='ENTRY'?'EXIT':'ENTRY';
   const b=document.getElementById('mode-btn');
@@ -475,12 +560,9 @@ function toggleMode(){
     b.textContent='🔴  EXIT MODE  —  Click here to switch to ENTRY MODE';
     b.className='m-exit';
   }
-  cancelPick();
-  out(`Switched to ${mode} MODE`,'');
-  focus();
+  cancelPick(); out(`Switched to ${mode} MODE`,''); focus();
 }
 
-// output
 let otimer=null;
 function out(msg,cls){
   const el=document.getElementById('outtxt');
@@ -490,10 +572,8 @@ function out(msg,cls){
   if(cls==='os'||cls==='ox')
     otimer=setTimeout(()=>{el.textContent='Awaiting scan or ID entry…';el.className='';},3000);
 }
+function focus(){document.getElementById('idinput').focus();}
 
-function focus(){ document.getElementById('idinput').focus(); }
-
-// process input
 async function go(){
   const raw=document.getElementById('idinput').value.trim();
   if(!raw)return;
@@ -518,7 +598,6 @@ async function go(){
   }
 }
 
-// vehicle picker
 function showPick(info){
   const clr={Student:'var(--green)',Teacher:'var(--accent)',Guest:'var(--yellow)'}[info.role]||'var(--text)';
   document.getElementById('vpid').textContent=info.id;
@@ -559,9 +638,6 @@ window.addEventListener('load',focus);
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    print(f"\n{'═'*50}")
-    print(f"  MMCOE Parking  —  Created by Pushkar")
-    print(f"{'═'*50}")
-    print(f"  Open: http://localhost:{port}")
-    print(f"{'═'*50}\n")
+    print(f"\n  MMCOE Parking — Created by Pushkar")
+    print(f"  Open: http://localhost:{port}\n")
     app.run(host="0.0.0.0", port=port, debug=False)
